@@ -90,6 +90,8 @@ PERIODIC_INTERVAL = 300
 MAX_BACKOFF = 600
 LOG_JSONL = "/tmp/build_watcher_enterprise_events.jsonl"
 CACHE_DIR = "/tmp/build_watcher_cache"
+ROLLBACK_DIR = "/tmp/build_watcher_rollback"
+MAX_ROLLBACK = 3
 MAX_HISTORY = 500
 
 ERROR_PATTERNS = {
@@ -345,6 +347,9 @@ def ensure_schema(conn: sqlite3.Connection):
             error_detail TEXT,
             auto_fixed INTEGER,
             backoff INTEGER,
+            cached INTEGER DEFAULT 0,
+            artifact_sha256 TEXT,
+            artifact_size_bytes INTEGER,
             ts TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -373,12 +378,35 @@ def ensure_schema(conn: sqlite3.Connection):
             value TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rollback_index (
+            project TEXT PRIMARY KEY,
+            path TEXT,
+            sha256 TEXT,
+            size_bytes INTEGER,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
     conn.commit()
 
 
 def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(STATE_DB, check_same_thread=False)
     ensure_schema(conn)
+    with db_lock:
+        try:
+            conn.execute("ALTER TABLE build_events ADD COLUMN cached INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE build_events ADD COLUMN artifact_sha256 TEXT")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE build_events ADD COLUMN artifact_size_bytes INTEGER")
+        except Exception:
+            pass
+        conn.commit()
     return conn
 
 
@@ -389,7 +417,7 @@ def get_file_checksums(project_path: str) -> List[tuple]:
     checksums = []
     base = Path(project_path)
     for pattern in src_dirs:
-        matches = [base] if pattern == "." else list(base.glob(pattern))
+        matches = list(base.glob(pattern))
         for m in matches:
             if m.is_file() and m.exists():
                 try:
@@ -483,7 +511,20 @@ def verify_smoke_test(project: Dict) -> tuple:
                     if r.returncode == 0 and "package:" in r.stdout:
                         pkg = re.search(r"package: name='([^']+)'", r.stdout)
                         ver = re.search(r"versionName='([^']+)'", r.stdout)
-                        return True, f"APK valid pkg={pkg.group(1) if pkg else '?'} ver={ver.group(1) if ver else '?'}"
+                        pkg_name = pkg.group(1) if pkg else "?"
+                        ver_name = ver.group(1) if ver else "?"
+                        adb_ok = False
+                        try:
+                            r2 = subprocess.run(["adb", "install", "-r", full], capture_output=True, text=True, timeout=30)
+                            adb_ok = r2.returncode == 0
+                        except Exception:
+                            pass
+                        detail = f"APK valid pkg={pkg_name} ver={ver_name}"
+                        if adb_ok:
+                            detail += " adb=installed"
+                        else:
+                            detail += " adb=skipped"
+                        return True, detail
                 except Exception:
                     pass
         return False, "No valid APK found"
@@ -492,9 +533,37 @@ def verify_smoke_test(project: Dict) -> tuple:
         if os.path.exists(jarpath):
             try:
                 r = subprocess.run(["jar", "tf", jarpath], capture_output=True, text=True, timeout=10)
-                if r.returncode == 0 and "BOOT-INF/classes" in r.stdout:
-                    return True, f"JAR valid ({len(r.stdout.splitlines())} entries)"
-                return True, f"JAR exists ({r.returncode})"
+                entries = len(r.stdout.splitlines()) if r.returncode == 0 else 0
+                proc = None
+                try:
+                    proc = subprocess.Popen(
+                        ["java", "-jar", jarpath],
+                        cwd=path,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    time.sleep(3)
+                    if proc.poll() is None:
+                        try:
+                            health = subprocess.run(
+                                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://localhost:8080/actuator/health"],
+                                timeout=5,
+                            )
+                            code = health.stdout.strip() if health.returncode == 0 else "000"
+                            if code in ("200", "401", "403"):
+                                return True, f"JAR valid ({entries} entries) health={code}"
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                finally:
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            proc.kill()
+                return True, f"JAR valid ({entries} entries) health=skipped"
             except Exception:
                 pass
         return False, "JAR missing"
@@ -503,16 +572,19 @@ def verify_smoke_test(project: Dict) -> tuple:
 
 def profile_steps(stdout_text: str, duration_ms: int) -> Dict[str, float]:
     steps = {}
-    pattern = re.compile(r"> Task :([^\s]+)\s+(\S+)")
-    matches = pattern.findall(stdout_text)
-    if not matches:
+    gradle_pattern = re.compile(r"> Task :([^\s]+)\s+(\S+)")
+    matches = gradle_pattern.findall(stdout_text)
+    if matches:
+        per_step = duration_ms / max(len(matches), 1)
+        for task, status in matches:
+            steps[task] = 0.1 if status == "UP-TO-DATE" else per_step
         return steps
-    per_step = duration_ms / max(len(matches), 1)
-    for task, status in matches:
-        if status in ("UP-TO-DATE",):
-            steps[task] = 0.1
-        else:
-            steps[task] = per_step
+    maven_pattern = re.compile(r"\[INFO\] ---\s+([^\s]+):(\S+)\s+\((\S+)\)\s+---")
+    maven_matches = maven_pattern.findall(stdout_text)
+    if maven_matches:
+        per_step = duration_ms / max(len(maven_matches), 1)
+        for plugin, goal, phase in maven_matches:
+            steps[f"{plugin}:{goal}"] = per_step
     return steps
 
 
@@ -539,7 +611,7 @@ def calculate_trends(conn: sqlite3.Connection, project: str, days: int = 7) -> D
     }
 
 
-def render_dashboard(projects: List[Dict], monitor: ResourceMonitor, current_runs: Dict[str, BuildEvent]):
+def render_dashboard(projects: List[Dict], monitor: ResourceMonitor, current_runs: Dict[str, BuildEvent], start_time: float):
     if not RICH_AVAILABLE:
         return
     layout = Layout()
@@ -552,8 +624,9 @@ def render_dashboard(projects: List[Dict], monitor: ResourceMonitor, current_run
         Layout(name="resources", ratio=1),
     )
 
+    uptime = int(time.time() - start_time)
     header_text = Text("⚡ Advanced Build Watcher Enterprise", style="bold cyan")
-    header_text.append(f"  |  {datetime.now().strftime('%H:%M:%S')}  |  Ctrl+C to stop", style="dim")
+    header_text.append(f"  |  {datetime.now().strftime('%H:%M:%S')}  |  Uptime: {uptime}s  |  Ctrl+C to stop", style="dim")
     layout["header"].update(Panel(header_text))
 
     proj_table = Table(show_header=True, header_style="bold magenta", expand=True)
@@ -561,7 +634,7 @@ def render_dashboard(projects: List[Dict], monitor: ResourceMonitor, current_run
     proj_table.add_column("Status", justify="center")
     proj_table.add_column("Last Duration", justify="right")
     proj_table.add_column("Error", justify="center")
-    proj_table.add_column("Backoff", justify="right")
+    proj_table.add_column("Next In", justify="right")
     proj_table.add_column("Cache", justify="center")
     proj_table.add_column("Changed", justify="center")
 
@@ -572,17 +645,24 @@ def render_dashboard(projects: List[Dict], monitor: ResourceMonitor, current_run
             status = "🔄 building"
             dur = f"{ev.duration_ms}ms"
             err = ev.error_type or "-"
-            backoff = str(ev.backoff) + "s"
+            next_in = "now"
             cache = "💾" if ev.cached else ""
             changed = str(len(ev.changed_files)) if ev.changed_files else "0"
         else:
             status = "✅ idle"
             dur = "-"
             err = "-"
-            backoff = f"{p.get('_backoff', 0)}s"
+            elapsed = time.time() - p.get("_last_build_ts", 0)
+            backoff = p.get("_backoff", 0)
+            if elapsed < backoff:
+                next_in = f"{int(backoff - elapsed)}s"
+            elif elapsed < PERIODIC_INTERVAL:
+                next_in = f"{int(PERIODIC_INTERVAL - elapsed)}s"
+            else:
+                next_in = "poll"
             cache = ""
             changed = str(len(p.get("_last_changed_files", []))) if p.get("_last_changed_files") else "0"
-        proj_table.add_row(name, status, dur, err, backoff, cache, changed)
+        proj_table.add_row(name, status, dur, err, next_in, cache, changed)
 
     layout["projects"].update(Panel(proj_table, title="Build Status", border_style="green"))
 
@@ -594,8 +674,7 @@ def render_dashboard(projects: List[Dict], monitor: ResourceMonitor, current_run
     )
     layout["resources"].update(Panel(res_text, title="System Resources", border_style="yellow"))
 
-    console.clear()
-    console.print(layout)
+    return layout
 
 
 def run_build(project: Dict, conn: sqlite3.Connection, monitor: ResourceMonitor,
@@ -626,6 +705,8 @@ def run_build(project: Dict, conn: sqlite3.Connection, monitor: ResourceMonitor,
             cached=True,
         )
         log_event(ev)
+        persist_event(conn, ev)
+        update_trend(conn, ev)
         return ev
 
     os.makedirs(path, exist_ok=True)
@@ -672,12 +753,15 @@ def run_build(project: Dict, conn: sqlite3.Connection, monitor: ResourceMonitor,
 
     artifacts_ok = True
     missing_artifacts = []
+    artifact_paths = []
     if success:
         for art in artifacts:
             full = os.path.join(path, art)
             if not os.path.exists(full):
                 artifacts_ok = False
                 missing_artifacts.append(art)
+            else:
+                artifact_paths.append(full)
 
     smoke_ok, smoke_detail = verify_smoke_test(project) if (success and artifacts_ok) else (None, "Skipped")
     git_info = GitHelper.current_commit(path) if GitHelper.project_root(path) else None
@@ -720,6 +804,9 @@ def run_build(project: Dict, conn: sqlite3.Connection, monitor: ResourceMonitor,
             console.print(f"[yellow]🔧 Auto-fix applied for {name}. Retrying...[/yellow]")
         return run_build(project, conn, monitor, changed_files)
 
+    if ev.success:
+        save_rollback(project, artifacts)
+
     log_event(ev)
     persist_event(conn, ev)
     update_trend(conn, ev)
@@ -748,13 +835,25 @@ def log_event(ev: BuildEvent):
 
 
 def persist_event(conn: sqlite3.Connection, ev: BuildEvent):
+    art_sha = ""
+    art_size = 0
+    if ev.success and not ev.cached:
+        for art in PROJECTS:
+            if art["name"] == ev.project:
+                for a in art.get("artifacts", []):
+                    full = Path(art["path"]) / a
+                    if full.exists():
+                        art_sha = hashlib.sha256(full.read_bytes()).hexdigest()
+                        art_size = full.stat().st_size
+                        break
+                break
     with db_lock:
         c = conn.cursor()
         c.execute(
-            "INSERT INTO build_events (project, success, duration_ms, error_type, error_detail, auto_fixed, backoff) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO build_events (project, success, duration_ms, error_type, error_detail, auto_fixed, backoff, cached, artifact_sha256, artifact_size_bytes) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (ev.project, int(ev.success), ev.duration_ms, ev.error_type, ev.error_detail[:200],
-             ev.auto_fixed, ev.backoff),
+             ev.auto_fixed, ev.backoff, int(ev.cached), art_sha, art_size),
         )
         conn.commit()
 
@@ -778,6 +877,56 @@ def update_trend(conn: sqlite3.Connection, ev: BuildEvent):
                 (ev.project, today, ev.duration_ms, int(ev.success), 1),
             )
         conn.commit()
+
+
+def save_rollback(project: Dict, artifacts: List[str]):
+    rollback_path = Path(ROLLBACK_DIR)
+    rollback_path.mkdir(parents=True, exist_ok=True)
+    proj_dir = rollback_path / project["name"].replace(" ", "_")
+    proj_dir.mkdir(parents=True, exist_ok=True)
+
+    existing = sorted([d for d in proj_dir.iterdir() if d.is_dir()], key=lambda d: d.stat().st_mtime)
+    while len(existing) >= MAX_ROLLBACK:
+        shutil.rmtree(existing[0])
+        existing.pop(0)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = proj_dir / ts
+    dest.mkdir(parents=True, exist_ok=True)
+
+    saved = []
+    for art in artifacts:
+        src = Path(project["path"]) / art
+        if src.exists():
+            dst = dest / Path(art).name
+            shutil.copy2(src, dst)
+            saved.append(str(dst))
+
+    with db_lock:
+        conn = sqlite3.connect(STATE_DB, check_same_thread=False)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO rollback_index (project, path, sha256, size_bytes) VALUES (?,?,?,?)",
+                (project["name"], str(dest), "", sum(Path(p).stat().st_size for p in saved if Path(p).exists())),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    return str(dest)
+
+
+def restore_rollback(project_name: str) -> Optional[str]:
+    rollback_path = Path(ROLLBACK_DIR)
+    proj_dir = rollback_path / project_name.replace(" ", "_")
+    if not proj_dir.exists():
+        return None
+    entries = sorted([d for d in proj_dir.iterdir() if d.is_dir()], key=lambda d: d.stat().st_mtime, reverse=True)
+    if not entries:
+        return None
+    return str(entries[0])
 
 
 def print_trend_report(conn: sqlite3.Connection):
@@ -830,71 +979,74 @@ def watcher():
 
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            while True:
-                now = time.time()
-                any_changed = False
-                for p in PROJECTS:
-                    changed, files = has_source_changed(conn, p["name"], p["path"])
-                    p["_last_changed_files"] = files
-                    if changed:
-                        any_changed = True
+            start_time = time.time()
+            with Live(
+                render_dashboard(PROJECTS, monitor, current_runs, start_time),
+                console=console,
+                refresh_per_second=2,
+                screen=True,
+            ) as live:
+                while True:
+                    now = time.time()
+                    any_changed = False
+                    for p in PROJECTS:
+                        changed, files = has_source_changed(conn, p["name"], p["path"])
+                        p["_last_changed_files"] = files
+                        if changed:
+                            any_changed = True
 
-                if any_changed:
-                    if RICH_AVAILABLE:
-                        console.print("[green]📁 Source change detected — triggering builds[/green]")
+                    if any_changed:
+                        if RICH_AVAILABLE:
+                            console.print("[green]📁 Source change detected — triggering builds[/green]")
+
+                    should_build = False
+                    if any_changed:
+                        should_build = True
                     else:
-                        print("Source change detected — triggering builds")
+                        for p in PROJECTS:
+                            elapsed = time.time() - p.get("_last_build_ts", 0)
+                            if elapsed >= max(p.get("_backoff", 0), PERIODIC_INTERVAL):
+                                should_build = True
+                                break
 
-                should_build = False
-                if any_changed:
-                    should_build = True
-                else:
-                    for p in PROJECTS:
-                        elapsed = time.time() - p.get("_last_build_ts", 0)
-                        if elapsed >= max(p.get("_backoff", 0), PERIODIC_INTERVAL):
-                            should_build = True
-                            break
+                    if should_build:
+                        futures = {}
+                        for p in PROJECTS:
+                            if p.get("_backoff", 0) > 0 and not any_changed:
+                                continue
+                            fut = executor.submit(run_build, p, conn, monitor, p.get("_last_changed_files", []))
+                            futures[fut] = p
+                        for fut in as_completed(futures):
+                            p = futures[fut]
+                            try:
+                                ev = fut.result()
+                                p["_backoff"] = 0 if ev.success else min(p.get("_backoff", 0) * 2 + POLL_INTERVAL, MAX_BACKOFF)
+                                p["_last_build_ts"] = time.time()
+                                current_runs[p["name"]] = ev
 
-                if should_build:
-                    futures = {}
-                    for p in PROJECTS:
-                        if p.get("_backoff", 0) > 0 and not any_changed:
-                            continue
-                        fut = executor.submit(run_build, p, conn, monitor, p.get("_last_changed_files", []))
-                        futures[fut] = p
-                    for fut in as_completed(futures):
-                        p = futures[fut]
-                        try:
-                            ev = fut.result()
-                            p["_backoff"] = 0 if ev.success else min(p.get("_backoff", 0) * 2 + POLL_INTERVAL, MAX_BACKOFF)
-                            p["_last_build_ts"] = time.time()
-                            current_runs[p["name"]] = ev
+                                notify_list = p.get("notify_on", [])
+                                if "failure" in notify_list and not ev.success:
+                                    desktop_notify(f"{p['name']} build failed", f"Error: {ev.error_type}")
+                                if "success_first" in notify_list and ev.success and not first_success_notified[p["name"]]:
+                                    first_success_notified[p["name"]] = True
+                                    desktop_notify(f"{p['name']} build ok", "First success in this session")
+                            except Exception as e:
+                                current_runs[p["name"]] = BuildEvent(
+                                    ts=datetime.now(timezone.utc).isoformat(),
+                                    project=p["name"],
+                                    success=False,
+                                    duration_ms=0,
+                                    returncode=-1,
+                                    error_type="watcher_exception",
+                                    severity="fatal",
+                                    fix_suggestion=str(e),
+                                    error_detail=str(e)[:200],
+                                    auto_fixed=0,
+                                    backoff=p.get("_backoff", 0),
+                                )
 
-                            notify_list = p.get("notify_on", [])
-                            if "failure" in notify_list and not ev.success:
-                                desktop_notify(f"{p['name']} build failed", f"Error: {ev.error_type}")
-                            if "success_first" in notify_list and ev.success and not first_success_notified[p["name"]]:
-                                first_success_notified[p["name"]] = True
-                                desktop_notify(f"{p['name']} build ok", "First success in this session")
-                        except Exception as e:
-                            current_runs[p["name"]] = BuildEvent(
-                                ts=datetime.now(timezone.utc).isoformat(),
-                                project=p["name"],
-                                success=False,
-                                duration_ms=0,
-                                returncode=-1,
-                                error_type="watcher_exception",
-                                severity="fatal",
-                                fix_suggestion=str(e),
-                                error_detail=str(e)[:200],
-                                auto_fixed=0,
-                                backoff=p.get("_backoff", 0),
-                            )
-
-                if RICH_AVAILABLE:
-                    render_dashboard(PROJECTS, monitor, current_runs)
-
-                time.sleep(POLL_INTERVAL)
+                    live.update(render_dashboard(PROJECTS, monitor, current_runs, start_time))
+                    time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
         if RICH_AVAILABLE:
@@ -908,6 +1060,39 @@ def main():
     if len(sys.argv) > 1:
         if sys.argv[1] in ("--trends", "--report"):
             print_trend_report(get_db())
+            return
+        if sys.argv[1] == "--clear-cache":
+            shutil.rmtree(CACHE_DIR, ignore_errors=True)
+            Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
+            print("Cache cleared.")
+            return
+        if sys.argv[1] == "--rollback":
+            if len(sys.argv) < 3:
+                print("Usage: watcher.py --rollback <project>", file=sys.stderr)
+                sys.exit(1)
+            target = sys.argv[2]
+            found = False
+            for p in PROJECTS:
+                if target.lower() in p["name"].lower():
+                    path = restore_rollback(p["name"])
+                    if path:
+                        print(f"Rollback restored to: {path}")
+                    else:
+                        print("No rollback available.", file=sys.stderr)
+                        sys.exit(1)
+                    found = True
+                    break
+            if not found:
+                print(f"Project not found. Available: {[p['name'] for p in PROJECTS]}", file=sys.stderr)
+                sys.exit(1)
+            return
+        if sys.argv[1] == "--validate":
+            conn = get_db()
+            monitor = ResourceMonitor()
+            for p in PROJECTS:
+                changed, files = has_source_changed(conn, p["name"], p["path"])
+                ev = run_build(p, conn, monitor, files)
+                print(f"{'OK' if ev.success else 'FAIL'} {p['name']} ({ev.duration_ms}ms)")
             return
         target = sys.argv[1]
         found = False

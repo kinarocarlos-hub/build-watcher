@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.db
+*.jsonl
+*.log
+build_watcher_cache/
+build_watcher_rollback/
